@@ -212,6 +212,101 @@ if (isset($_GET['api'])) {
         exit;
     }
 
+    if ($action === 'save') {
+        $locks = getActiveLocks();
+        $lockedBy = $locks[$reqFile]['user'] ?? null;
+        
+        if (!$lockedBy || $lockedBy === $CURRENT_USER) {
+            // 1. Local File History: Backup before overwrite
+            $historyDir = $BASE_DIR . '/.ide-history';
+            if (!is_dir($historyDir)) mkdir($historyDir, 0777, true);
+            
+            if (file_exists($reqFile)) {
+                // Save backup with hash and timestamp
+                $backupName = md5($reqFile) . '_' . time() . '.bak';
+                copy($reqFile, $historyDir . '/' . $backupName);
+            }
+
+            // Save the new content
+            file_put_contents($reqFile, $_POST['content']);
+            
+            // Renew lock
+            $locks[$reqFile] = ['user' => $CURRENT_USER, 'time' => time()];
+            saveActiveLocks($locks);
+
+            // 2. Offline Linter: Check PHP syntax
+            $lintError = null;
+            $lintLine = null;
+            if (pathinfo($reqFile, PATHINFO_EXTENSION) === 'php') {
+                exec('php -l ' . escapeshellarg($reqFile) . ' 2>&1', $output, $return_var);
+                if ($return_var !== 0) {
+                    $lintStr = implode(" ", $output);
+                    $lintError = $lintStr;
+                    // Extract line number via regex
+                    if (preg_match('/on line (\d+)/', $lintStr, $matches)) {
+                        $lintLine = $matches[1];
+                    }
+                }
+            }
+
+            echo json_encode([
+                'status' => 'success', 
+                'message' => 'File saved successfully.',
+                'lintError' => $lintError,
+                'lintLine' => $lintLine
+            ]);
+        } else {
+            echo json_encode(['status' => 'error', 'message' => 'File is currently locked by another user.']);
+        }
+        exit;
+    }
+
+    if ($action === 'search_files') {
+        $query = $_GET['q'] ?? '';
+        if (strlen($query) < 2) {
+            echo json_encode(['status' => 'success', 'results' => []]); exit;
+        }
+
+        $results = [];
+        $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($BASE_DIR));
+        
+        foreach ($iterator as $fileinfo) {
+            if ($fileinfo->isFile()) {
+                $path = $fileinfo->getPathname();
+                // Skip hidden files/directories and images
+                if (strpos($path, '/.') !== false || preg_match('/\.(jpg|png|gif|zip)$/i', $path)) continue;
+                
+                $content = file_get_contents($path);
+                if (stripos($content, $query) !== false) {
+                    $relPath = str_replace('\\', '/', substr($path, strlen($BASE_DIR) + 1));
+                    // Get a snippet of the match
+                    preg_match('/^.*?' . preg_quote($query, '/') . '.*$/mi', $content, $matches);
+                    $results[] = [
+                        'path' => $relPath,
+                        'snippet' => trim($matches[0] ?? '')
+                    ];
+                }
+            }
+        }
+        echo json_encode(['status' => 'success', 'results' => $results]);
+        exit;
+    }
+
+    if ($action === 'stream') {
+        if (!$isSafe || !$reqFile || !file_exists($reqFile) || is_dir($reqFile)) {
+            header('HTTP/1.0 404 Not Found');
+            exit;
+        }
+        // Get the actual MIME type of the image
+        $mime = mime_content_type($reqFile);
+        if (!$mime) $mime = 'application/octet-stream';
+        
+        header('Content-Type: ' . $mime);
+        header('Content-Length: ' . filesize($reqFile));
+        readfile($reqFile);
+        exit;
+    }
+
     echo json_encode(['status' => 'error', 'message' => 'Unknown endpoint']);
     exit;
 }
@@ -225,7 +320,7 @@ if (isset($_GET['api'])) {
     <title>Enterprise Web IDE</title>
     
     <!-- CSS & Icons -->
-    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="tailwind.js"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
     <!-- FZF-style fuzzy search library -->
     <script src="https://cdn.jsdelivr.net/npm/fuse.js/dist/fuse.min.js"></script>
@@ -252,8 +347,49 @@ if (isset($_GET['api'])) {
         ::-webkit-scrollbar-track { background: transparent; }
         ::-webkit-scrollbar-thumb { background: #52525b; border-radius: 4px; }
         ::-webkit-scrollbar-thumb:hover { background: #71717a; }
+        /* Context Menu Styles */
+        #context-menu {
+            display: none;
+            position: absolute;
+            z-index: 1000;
+            background: #18181b; /* zinc-900 */
+            border: 1px solid #27272a; /* zinc-800 */
+            border-radius: 6px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
+            min-width: 150px;
+            padding: 4px;
+        }
+        .context-item {
+            padding: 6px 10px;
+            font-size: 12px;
+            color: #d4d4d8;
+            cursor: pointer;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+        }
+        .context-item:hover { background: #3f3f46; color: white; }
+        .context-item i { width: 14px; height: 14px; margin-right: 8px; }
+        .split-view { display: flex; width: 100%; height: 100%; }
+        .split-editor { flex: 1; min-width: 0; border-right: 1px solid #27272a; }
+        .split-preview { flex: 1; min-width: 0; background: #18181b; padding: 20px; overflow-y: auto; color: #e4e4e7; }
+        
+        /* Basic Markdown Styles */
+        .markdown-body h1, .markdown-body h2 { border-bottom: 1px solid #3f3f46; padding-bottom: 0.3em; margin-bottom: 16px; margin-top: 24px;}
+        .markdown-body h1 { font-size: 2em; }
+        .markdown-body h2 { font-size: 1.5em; }
+        .markdown-body p { margin-bottom: 16px; line-height: 1.6; }
+        .markdown-body code { background: #27272a; padding: 0.2em 0.4em; border-radius: 3px; font-family: monospace; }
+        .markdown-body pre { background: #09090b; padding: 16px; border-radius: 6px; overflow-x: auto; }
+        .markdown-body pre code { background: transparent; padding: 0; }
+        .markdown-body ul { list-style-type: disc; padding-left: 2em; margin-bottom: 16px; }
+        /* Hide default absolute line numbers when Vim mode is toggled on */
+        .vim-mode-active .cm-gutters > .cm-lineNumbers:first-child { 
+            display: none !important; 
+        }
     </style>
 
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <!-- CodeMirror 6 Dependencies via Import Map -->
     <script type="importmap">
     {
@@ -297,8 +433,13 @@ if (isset($_GET['api'])) {
             </div>
         </div>
 
-        <div class="px-3 mb-2 shrink-0">
-            <input type="text" id="file-search" placeholder="Fuzzy search..." class="w-full bg-zinc-900 border border-zinc-800 rounded text-xs px-2 py-1.5 text-zinc-300 outline-none focus:border-indigo-500 transition-colors">
+        <div class="px-3 mb-2 shrink-0 flex flex-col space-y-2">
+            <input type="text" id="file-search" placeholder="Fuzzy file search..." class="w-full bg-zinc-900 border border-zinc-800 rounded text-xs px-2 py-1.5 text-zinc-300 outline-none focus:border-indigo-500 transition-colors">
+            
+            <div class="flex space-x-2">
+                <input type="text" id="global-search" placeholder="Search inside files..." class="w-full bg-zinc-900 border border-zinc-800 rounded text-xs px-2 py-1.5 text-zinc-300 outline-none focus:border-indigo-500 transition-colors">
+                <button id="run-global-search" class="bg-zinc-800 hover:bg-zinc-700 px-2 rounded border border-zinc-700 text-zinc-300"><i data-lucide="search" class="w-3.5 h-3.5"></i></button>
+            </div>
         </div>
         
         <div id="file-list" class="flex-1 overflow-y-auto px-2 py-1 space-y-0.5 text-sm">
@@ -352,6 +493,12 @@ if (isset($_GET['api'])) {
                 <button id="format-btn" class="flex items-center px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded-md text-xs font-medium transition-colors text-zinc-300" title="Format Code (Shift+Alt+F)">
                     <i data-lucide="align-left" class="w-3.5 h-3.5 mr-1.5"></i>
                     Format
+                </button>
+
+                <!-- Preview Toggle (for Markdown) -->
+                <button id="preview-btn" class="flex items-center px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 rounded-md text-xs font-medium transition-colors text-zinc-300 hidden" title="Toggle Preview">
+                    <i data-lucide="columns" class="w-3.5 h-3.5 mr-1.5"></i>
+                    Preview
                 </button>
 
                 <!-- Vim Toggle -->
@@ -409,10 +556,14 @@ if (isset($_GET['api'])) {
         </footer>
     </main>
 
+    <div id="context-menu">
+        <div class="context-item" id="ctx-rename"><i data-lucide="edit-2"></i> Rename</div>
+    </div>
+
     <!-- App Logic (ES Modules) -->
     <script type="module">
         import { EditorState, Compartment } from "@codemirror/state";
-        import { EditorView, keymap } from "@codemirror/view";
+        import { EditorView, keymap, lineNumbers } from "@codemirror/view";
         import { basicSetup } from "codemirror";
         import { indentWithTab } from "@codemirror/commands";
         
@@ -477,6 +628,65 @@ if (isset($_GET['api'])) {
         const langCompartment = new Compartment();
         const vimCompartment = new Compartment();
         const readOnlyCompartment = new Compartment();
+        const relLineNumbersCompartment = new Compartment();
+
+        // Generates dynamic Vim-style relative line numbers
+        function getRelativeLineNumbers() {
+            return lineNumbers({
+                formatNumber: (lineNo, state) => {
+                    const cursorLine = state.doc.lineAt(state.selection.main.head).number;
+                    if (lineNo === cursorLine) return lineNo.toString(); // Absolute for current line
+                    return Math.abs(cursorLine - lineNo).toString();     // Relative for others
+                }
+            });
+        }
+
+        let isPreviewOpen = false;
+
+        document.getElementById('preview-btn').addEventListener('click', () => {
+            if (!currentFile || !editorView) return;
+            const container = document.getElementById('editor-container');
+            const ext = currentFile.split('.').pop().toLowerCase();
+            
+            if (isPreviewOpen) {
+                // Close preview
+                container.classList.remove('split-view');
+                openTabs[currentFile].dom.classList.remove('split-editor');
+                const existingPreview = document.getElementById('live-preview-pane');
+                if (existingPreview) existingPreview.remove();
+                isPreviewOpen = false;
+            } else {
+                // Open preview
+                if (!['md', 'html'].includes(ext)) {
+                    showToast("Preview is only supported for Markdown and HTML.", "error");
+                    return;
+                }
+                
+                container.classList.add('split-view');
+                openTabs[currentFile].dom.classList.add('split-editor');
+                
+                const previewPane = document.createElement('div');
+                previewPane.id = 'live-preview-pane';
+                previewPane.className = 'split-preview markdown-body';
+                container.appendChild(previewPane);
+                
+                updatePreview();
+                isPreviewOpen = true;
+            }
+        });
+
+        function updatePreview() {
+            if (!isPreviewOpen || !currentFile || !editorView) return;
+            const ext = currentFile.split('.').pop().toLowerCase();
+            const content = editorView.state.doc.toString();
+            const pane = document.getElementById('live-preview-pane');
+            
+            if (ext === 'md') {
+                pane.innerHTML = marked.parse(content);
+            } else if (ext === 'html') {
+                pane.innerHTML = `<iframe srcdoc="${content.replace(/"/g, '&quot;')}" style="width:100%; height:100%; border:none; background:white;"></iframe>`;
+            }
+        }
 
         // --- Font Size Controls ---
         document.getElementById('font-inc').addEventListener('click', () => {
@@ -493,6 +703,33 @@ if (isset($_GET['api'])) {
                 document.documentElement.style.setProperty('--editor-fs', `${currentFontSize}px`);
                 document.getElementById('font-size-display').innerText = `${currentFontSize}px`;
             }
+        });
+
+        document.getElementById('run-global-search').addEventListener('click', async () => {
+            const query = document.getElementById('global-search').value;
+            if (query.length < 2) return;
+            
+            const container = document.getElementById('file-list');
+            container.innerHTML = '<div class="p-4 text-xs text-zinc-500 text-center">Searching...</div>';
+            
+            const res = await api('search_files', { q: query });
+            container.innerHTML = `<div class="px-3 py-1 text-xs text-indigo-400 font-semibold mb-2">Matches for "${query}"</div>`;
+            
+            if (res.status === 'success' && res.results.length > 0) {
+                res.results.forEach(match => {
+                    const div = document.createElement('div');
+                    div.className = 'group flex flex-col py-1.5 px-2 mb-1 rounded cursor-pointer transition-colors bg-zinc-900/50 hover:bg-zinc-800 border border-zinc-800/50';
+                    div.onclick = () => window.loadFile(match.path);
+                    div.innerHTML = `
+                        <div class="text-xs text-zinc-300 font-medium truncate"><i data-lucide="file-text" class="w-3 h-3 inline mr-1 text-indigo-400"></i>${match.path.split('/').pop()}</div>
+                        <div class="text-[10px] text-zinc-500 font-mono mt-1 truncate break-all">${match.snippet.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>
+                    `;
+                    container.appendChild(div);
+                });
+            } else {
+                container.innerHTML += '<div class="p-4 text-xs text-zinc-500 text-center">No matches found.</div>';
+            }
+            lucide.createIcons();
         });
 
         // --- API Communications (Direct Fetch, No Mock) ---
@@ -544,14 +781,14 @@ if (isset($_GET['api'])) {
                 document.getElementById('current-user-display').innerText = `Logged in as: ${sessionUser}`;
                 allFiles = res.files;
                 
-                // Initialize Fuse.js for powerful FZF-style searching
-                fuse = new Fuse(allFiles, {
-                    keys: ['path'],
-                    threshold: 0.3,
-                    includeScore: true
-                });
-
+                fuse = new Fuse(allFiles, { keys: ['path'], threshold: 0.3, includeScore: true });
                 renderTree(document.getElementById('file-search').value);
+
+                // FIX: Restore state only after files are loaded
+                if (!window.workspaceRestored) {
+                    restoreWorkspaceState();
+                    window.workspaceRestored = true; // Prevent looping
+                }
             } else {
                 showToast(res.message, 'error');
             }
@@ -590,7 +827,7 @@ if (isset($_GET['api'])) {
             return root;
         }
 
-        // Recursively render the nested DOM elements
+        // Recursively render the nested DOM elements (Cleaned up for Interns)
         function renderTreeNode(node, container, depth) {
             const children = Object.values(node.children).sort((a, b) => {
                 if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
@@ -599,10 +836,10 @@ if (isset($_GET['api'])) {
 
             children.forEach(child => {
                 const div = document.createElement('div');
-                
                 const row = document.createElement('div');
                 row.style.paddingLeft = `${depth * 12 + 4}px`;
-                row.className = `group flex items-center justify-between py-1.5 rounded cursor-pointer transition-colors ${child.path === currentFile ? 'bg-indigo-600/20 text-indigo-300' : 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'}`;
+                // Removed the 'group' class and hover actions
+                row.className = `flex items-center justify-between py-1.5 rounded cursor-pointer transition-colors ${child.path === currentFile ? 'bg-indigo-600/20 text-indigo-300' : 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'}`;
                 
                 let icon = child.isDir ? 'folder' : 'file-code';
                 if (!child.isDir) {
@@ -618,14 +855,12 @@ if (isset($_GET['api'])) {
                     ? `<i data-lucide="${isCollapsed ? 'chevron-right' : 'chevron-down'}" class="w-3.5 h-3.5 mr-1 opacity-70 shrink-0"></i>` 
                     : `<span class="w-4.5 mr-1 inline-block"></span>`;
 
+                // Removed the hidden action buttons completely
                 row.innerHTML = `
                     <div class="flex items-center flex-1 min-w-0" onclick="${child.isDir ? `window.toggleFolder('${child.path}', event)` : `window.loadFile('${child.path}')`}">
                         ${chevron}
                         <i data-lucide="${icon}" class="w-4 h-4 mr-1.5 opacity-70 shrink-0 ${child.isDir && !isCollapsed ? 'text-indigo-400' : ''}"></i>
                         <span class="truncate">${child.name}</span>
-                    </div>
-                    <div class="hidden group-hover:flex items-center space-x-1 px-1 shrink-0 bg-zinc-900/80 rounded">
-                        <button title="Rename" onclick="window.renameFile('${child.path}', event)" class="hover:text-indigo-400 p-1"><i data-lucide="edit-2" class="w-3.5 h-3.5"></i></button>
                     </div>
                 `;
                 
@@ -640,7 +875,7 @@ if (isset($_GET['api'])) {
             });
         }
 
-        // Render an FZF-style flat result list
+        // Render an FZF-style flat result list for searching
         function renderFlatNode(file, container) {
             const name = file.path.split('/').pop();
             const div = document.createElement('div');
@@ -667,6 +902,7 @@ if (isset($_GET['api'])) {
             container.appendChild(div);
         }
 
+        // The main tree renderer that was missing
         function renderTree(searchQuery = '') {
             const container = document.getElementById('file-list');
             container.innerHTML = '';
@@ -755,7 +991,11 @@ if (isset($_GET['api'])) {
                     api('unlock', { file: filename });
                 }
 
-                tabData.view.destroy();
+                // FIX: Only destroy the view if it's a CodeMirror instance (not an image)
+                if (tabData.view) {
+                    tabData.view.destroy();
+                }
+                
                 tabData.dom.remove();
                 delete openTabs[filename];
             }
@@ -778,6 +1018,9 @@ if (isset($_GET['api'])) {
             } else {
                 renderTabs();
             }
+            
+            // Save state after closing
+            saveWorkspaceState();
         };
 
         function renderTabs() {
@@ -851,6 +1094,24 @@ if (isset($_GET['api'])) {
             activeTab = filename;
             const tabData = openTabs[filename];
             
+            // --- NEW: Show/Hide Preview Button based on file type ---
+            const ext = filename.split('.').pop().toLowerCase();
+            const previewBtn = document.getElementById('preview-btn');
+            
+            if (['md', 'html'].includes(ext)) {
+                previewBtn.classList.remove('hidden');
+            } else {
+                previewBtn.classList.add('hidden');
+                // Force close the preview panel if we switch to a file that doesn't support it
+                if (window.isPreviewOpen) {
+                    document.getElementById('editor-container').classList.remove('split-view');
+                    const pane = document.getElementById('live-preview-pane');
+                    if (pane) pane.remove();
+                    window.isPreviewOpen = false;
+                }
+            }
+            // --------------------------------------------------------
+
             Object.values(openTabs).forEach(tab => tab.dom.classList.add('hidden'));
             tabData.dom.classList.remove('hidden');
             
@@ -865,7 +1126,11 @@ if (isset($_GET['api'])) {
             
             if (isReadOnly) {
                 lockBanner.classList.remove('hidden');
-                document.getElementById('lock-text').innerText = `Locked by ${tabData.lockedBy}`;
+                if (tabData.lockedBy) {
+                    document.getElementById('lock-text').innerText = `Locked by ${tabData.lockedBy}`;
+                } else {
+                    document.getElementById('lock-text').innerText = 'Read Only View';
+                }
             } else {
                 lockBanner.classList.add('hidden');
             }
@@ -878,6 +1143,20 @@ if (isset($_GET['api'])) {
         window.loadFile = async function(filename) {
             if (openTabs[filename]) {
                 switchToTab(filename);
+                return;
+            }
+
+            // Image Preview Handler
+            if (filename.match(/\.(jpg|jpeg|png|gif|svg)$/i)) {
+                const editorContainer = document.createElement('div');
+                editorContainer.className = 'absolute inset-0 hidden flex items-center justify-center bg-zinc-950 p-4';
+                // Note: Ensure your PHP server actually serves files from the browser directly for this to work
+                editorContainer.innerHTML = `<img src="?api=stream&file=${encodeURIComponent(filename)}" class="max-w-full max-h-full object-contain shadow-2xl border border-zinc-800 rounded">`;
+                document.getElementById('editor-container').appendChild(editorContainer);
+                
+                openTabs[filename] = { dom: editorContainer, view: null, isReadOnly: true, lockedBy: null, isDirty: false };
+                switchToTab(filename);
+                saveWorkspaceState(); // Save to local history
                 return;
             }
 
@@ -901,10 +1180,14 @@ if (isset($_GET['api'])) {
 
             // Track Unsaved Changes
             const changeListener = EditorView.updateListener.of((update) => {
-                if (update.docChanged && openTabs[filename] && !openTabs[filename].isDirty) {
-                    openTabs[filename].isDirty = true;
-                    renderTabs();
-                    if (activeTab === filename) updateSaveButtonState();
+                if (update.docChanged && openTabs[filename]) {
+                    if (!openTabs[filename].isDirty) {
+                        openTabs[filename].isDirty = true;
+                        renderTabs();
+                        if (activeTab === filename) updateSaveButtonState();
+                    }
+                    // Add this line inside the change listener:
+                    if (activeTab === filename) updatePreview();
                 }
             });
 
@@ -915,6 +1198,17 @@ if (isset($_GET['api'])) {
                         basicSetup,
                         customKeymap,
                         changeListener,
+                        EditorView.updateListener.of((update) => {
+                            if (update.selectionSet && vimModeEnabled && activeTab === filename) {
+                                setTimeout(() => {
+                                    if (update.view) {
+                                        update.view.dispatch({
+                                            effects: relLineNumbersCompartment.reconfigure(getRelativeLineNumbers())
+                                        });
+                                    }
+                                }, 0);
+                            }
+                        }),
                         autocompletion(),        // Adds smart intellisense/snippets
                         closeBrackets(),         // Auto-closes brackets/quotes
                         lintGutter(),            // Adds side gutter for linter errors
@@ -922,7 +1216,8 @@ if (isset($_GET['api'])) {
                         themeCompartment.of(getThemeExt(document.getElementById('theme-select').value)),
                         langCompartment.of(getLanguageExt(filename)),
                         vimCompartment.of(vimModeEnabled ? vim() : []),
-                        readOnlyCompartment.of(EditorState.readOnly.of(!res.canEdit))
+                        readOnlyCompartment.of(EditorState.readOnly.of(!res.canEdit)),
+                        relLineNumbersCompartment.of(vimModeEnabled ? getRelativeLineNumbers() : [])
                     ]
                 }),
                 parent: editorContainer
@@ -946,6 +1241,23 @@ if (isset($_GET['api'])) {
             switchToTab(filename);
         };
 
+        // Workspace Persistence Helpers
+        function saveWorkspaceState() {
+            const tabsToSave = Object.keys(openTabs);
+            localStorage.setItem('ide_open_tabs', JSON.stringify(tabsToSave));
+            localStorage.setItem('ide_active_tab', activeTab);
+        }
+
+        function restoreWorkspaceState() {
+            const savedTabs = JSON.parse(localStorage.getItem('ide_open_tabs') || '[]');
+            const savedActive = localStorage.getItem('ide_active_tab');
+            
+            savedTabs.forEach(file => window.loadFile(file));
+            if (savedActive && savedTabs.includes(savedActive)) {
+                setTimeout(() => switchToTab(savedActive), 500); // Slight delay to ensure loads finish
+            }
+        }
+
         async function saveCurrentFile() {
             if (!currentFile || isReadOnly) return;
             const content = editorView.state.doc.toString();
@@ -954,7 +1266,18 @@ if (isset($_GET['api'])) {
             const res = await api('save', { file: currentFile, content: content });
             
             if (res.status === 'success') {
-                showToast('File Saved Successfully');
+                // Check Linter Results
+                if (res.lintError) {
+                    const lineText = res.lintLine ? ` on line ${res.lintLine}` : '';
+                    showToast(`PHP Syntax Error${lineText}! Check console.`, 'error');
+                    console.error("PHP Lint Error:", res.lintError);
+                    document.getElementById('status-sync').innerText = `Syntax Error L${res.lintLine || '?'}`;
+                    document.getElementById('status-sync').classList.add('text-rose-400');
+                } else {                    showToast('File Saved Successfully');
+                    document.getElementById('status-sync').innerText = 'Synced';
+                    document.getElementById('status-sync').classList.remove('text-rose-400');
+                }
+                
                 openTabs[currentFile].isDirty = false;
                 renderTabs();
                 updateSaveButtonState();
@@ -1018,21 +1341,30 @@ if (isset($_GET['api'])) {
         document.getElementById('vim-toggle').addEventListener('click', (e) => {
             vimModeEnabled = !vimModeEnabled;
             const btn = e.currentTarget;
+            const editorContainer = document.getElementById('editor-container');
+
             if (vimModeEnabled) {
                 btn.classList.add('bg-indigo-600', 'text-white', 'border-indigo-600');
                 btn.classList.remove('bg-zinc-800', 'text-zinc-300');
                 btn.innerHTML = `<i data-lucide="keyboard" class="w-3.5 h-3.5 mr-1.5"></i> Vim: On`;
+                editorContainer.classList.add('vim-mode-active'); // Triggers CSS to hide default numbers
             } else {
                 btn.classList.remove('bg-indigo-600', 'text-white', 'border-indigo-600');
                 btn.classList.add('bg-zinc-800', 'text-zinc-300');
                 btn.innerHTML = `<i data-lucide="keyboard" class="w-3.5 h-3.5 mr-1.5"></i> Vim: Off`;
+                editorContainer.classList.remove('vim-mode-active');
             }
             lucide.createIcons();
             
-            const ext = vimModeEnabled ? vim() : [];
+            const vimExt = vimModeEnabled ? vim() : [];
+            const relNumExt = vimModeEnabled ? getRelativeLineNumbers() : [];
+            
             Object.values(openTabs).forEach(tab => {
                 tab.view.dispatch({
-                    effects: vimCompartment.reconfigure(ext)
+                    effects: [
+                        vimCompartment.reconfigure(vimExt),
+                        relLineNumbersCompartment.reconfigure(relNumExt)
+                    ]
                 });
             });
             
@@ -1075,6 +1407,36 @@ if (isset($_GET['api'])) {
         // Initialize App
         refreshFileList();
 
+        // --- Context Menu Logic ---
+        const contextMenu = document.getElementById('context-menu');
+        let contextMenuTargetFile = null;
+
+        document.getElementById('file-list').addEventListener('contextmenu', (e) => {
+            // Find the closest file/folder row that was right-clicked
+            const row = e.target.closest('[onclick^="window.loadFile"], [onclick^="window.toggleFolder"]');
+            if (!row) return;
+
+            e.preventDefault();
+            
+            // Extract the file path from the onclick attribute (hacky but effective for this setup)
+            const onclickAttr = row.getAttribute('onclick');
+            const match = onclickAttr.match(/'([^']+)'/);
+            if (match) {
+                contextMenuTargetFile = match[1];
+                contextMenu.style.display = 'block';
+                contextMenu.style.left = `${e.pageX}px`;
+                contextMenu.style.top = `${e.pageY}px`;
+            }
+        });
+
+        // Hide menu on outside click
+        document.addEventListener('click', () => { contextMenu.style.display = 'none'; });
+
+        // Bind Context Actions
+        document.getElementById('ctx-rename').addEventListener('click', (e) => {
+            if (contextMenuTargetFile) window.renameFile(contextMenuTargetFile, e);
+        });
+        restoreWorkspaceState();
     </script>
 </body>
 </html>
