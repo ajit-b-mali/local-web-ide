@@ -1,0 +1,1 @@
+console.log('Hello from main.js in sub-folder-1!');

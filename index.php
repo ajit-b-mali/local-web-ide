@@ -5,7 +5,7 @@ session_start();
 // --- Configuration ---
 // Files that users are strictly NOT allowed to open or edit
 $RESTRICTED_FILES = ['.env', 'config.php', 'wp-config.php', 'secret.txt', 'index.php']; 
-$BASE_DIR = str_replace('\\', '/', __DIR__); // Directory to serve files from
+$BASE_DIR = str_replace('\\', '/', __DIR__ . '/folder'); // Directory to serve files from
 $LOCK_DB = $BASE_DIR . '/.ide-locks.json'; // Centralized lock registry
 
 // Simulate a logged-in user for concurrency locking (in production, use your real auth session)
