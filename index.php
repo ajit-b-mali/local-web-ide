@@ -383,10 +383,6 @@ if (isset($_GET['api'])) {
         .markdown-body pre { background: #09090b; padding: 16px; border-radius: 6px; overflow-x: auto; }
         .markdown-body pre code { background: transparent; padding: 0; }
         .markdown-body ul { list-style-type: disc; padding-left: 2em; margin-bottom: 16px; }
-        /* Hide default absolute line numbers when Vim mode is toggled on */
-        .vim-mode-active .cm-gutters > .cm-lineNumbers:first-child { 
-            display: none !important; 
-        }
     </style>
 
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
@@ -634,6 +630,9 @@ if (isset($_GET['api'])) {
         function getRelativeLineNumbers() {
             return lineNumbers({
                 formatNumber: (lineNo, state) => {
+                    // Fallback if state or selection isn't fully ready
+                    if (!state || !state.selection || !state.selection.main) return lineNo.toString();
+                    
                     const cursorLine = state.doc.lineAt(state.selection.main.head).number;
                     if (lineNo === cursorLine) return lineNo.toString(); // Absolute for current line
                     return Math.abs(cursorLine - lineNo).toString();     // Relative for others
@@ -1209,14 +1208,16 @@ if (isset($_GET['api'])) {
                                 }, 0);
                             }
                         }),
-                        autocompletion(),        // Adds smart intellisense/snippets
-                        closeBrackets(),         // Auto-closes brackets/quotes
-                        lintGutter(),            // Adds side gutter for linter errors
-                        abbreviationTracker(),   // Emmet support
+                        autocompletion(),
+                        closeBrackets(),
+                        lintGutter(),
+                        abbreviationTracker(),
                         themeCompartment.of(getThemeExt(document.getElementById('theme-select').value)),
                         langCompartment.of(getLanguageExt(filename)),
                         vimCompartment.of(vimModeEnabled ? vim() : []),
                         readOnlyCompartment.of(EditorState.readOnly.of(!res.canEdit)),
+                        
+                        // THIS MUST BE AT THE END (After basicSetup)
                         relLineNumbersCompartment.of(vimModeEnabled ? getRelativeLineNumbers() : [])
                     ]
                 }),
